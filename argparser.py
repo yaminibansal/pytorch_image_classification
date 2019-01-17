@@ -1,5 +1,3 @@
-# coding: utf-8
-
 import json
 from collections import OrderedDict
 import torch
@@ -79,6 +77,11 @@ def _check_optim_config(config):
             message = 'When using Adam, key `{}` must be specified.'.format(
                 key)
             assert key in config.keys(), message
+    elif optimizer == 'lars':
+        for key in ['momentum']:
+            message = 'When using LARS, key `{}` must be specified.'.format(
+                key)
+            assert key in config.keys(), message
 
     scheduler = config['scheduler']
     if scheduler == 'multistep':
@@ -89,22 +92,33 @@ def _check_optim_config(config):
         for key in ['lr_min']:
             message = 'Key `{}` must be specified.'.format(key)
             assert key in config.keys(), message
+    elif scheduler == 'sgdr':
+        for key in ['lr_min', 'T0', 'Tmult']:
+            message = 'Key `{}` must be specified.'.format(key)
+            assert key in config.keys(), message
 
 
 def _get_optim_config(args):
     keys = [
         'epochs',
         'batch_size',
+        'ghost_batch_size',
         'optimizer',
         'base_lr',
         'weight_decay',
+        'no_weight_decay_on_bn',
         'momentum',
         'nesterov',
+        'gradient_clip',
         'scheduler',
         'milestones',
         'lr_decay',
         'lr_min',
+        'T0',
+        'Tmult',
         'betas',
+        'lars_eps',
+        'lars_thresh',
     ]
     json_keys = ['milestones', 'betas']
     config = _args2config(args, keys, json_keys)
@@ -120,22 +134,44 @@ def _get_data_config(args):
         'n_classes',
         'num_workers',
         'batch_size',
+        'use_random_crop',
+        'random_crop_padding',
+        'use_horizontal_flip',
         'use_cutout',
+        'use_dual_cutout',
         'cutout_size',
         'cutout_prob',
         'cutout_inside',
         'use_random_erasing',
+        'dual_cutout_alpha',
         'random_erasing_prob',
         'random_erasing_area_ratio_range',
         'random_erasing_min_aspect_ratio',
         'random_erasing_max_attempt',
         'use_mixup',
         'mixup_alpha',
+        'use_ricap',
+        'ricap_beta',
+        'use_label_smoothing',
+        'label_smoothing_epsilon',
     ]
     json_keys = ['random_erasing_area_ratio_range']
     config = _args2config(args, keys, json_keys)
-    config['use_gpu'] = True if args.gpu != '-1' else False
+    config['use_gpu'] = args.device != 'cpu'
+    _check_data_config(config)
     return config
+
+
+def _check_data_config(config):
+    if config['use_cutout'] and config['use_dual_cutout']:
+        raise ValueError(
+            'Only one of `use_cutout` and `use_dual_cutout` can be `True`.')
+    if sum([
+            config['use_mixup'], config['use_ricap'], config['use_dual_cutout']
+    ]) > 1:
+        raise ValueError(
+            'Only one of `use_mixup`, `use_ricap` and `use_dual_cutout` can be `True`.'
+        )
 
 
 def _get_run_config(args):
@@ -143,7 +179,9 @@ def _get_run_config(args):
         'outdir',
         'seed',
         'test_first',
-        'gpu',
+        'device',
+        'fp16',
+        'use_amp',
         'tensorboard',
         'tensorboard_train_images',
         'tensorboard_test_images',
@@ -151,7 +189,6 @@ def _get_run_config(args):
     ]
     config = _args2config(args, keys, None)
 
-    config['use_gpu'] = True if args.gpu != '-1' else False
     return config
 
 
@@ -168,15 +205,15 @@ def _get_env_info(args):
         capability = '{}.{}'.format(*capability)
         return name, capability
 
-    for gpu_id in args.gpus:
-        if gpu_id == -1:
-            continue
-
-        name, capability = _get_device_info(gpu_id)
-        info['gpu{}'.format(gpu_id)] = OrderedDict({
-            'name': name,
-            'capability': capability,
-        })
+    if args.device != 'cpu':
+        for gpu_id in range(torch.cuda.device_count()):
+            name, capability = _get_device_info(gpu_id)
+            info['gpu{}'.format(gpu_id)] = OrderedDict({
+                'name':
+                name,
+                'capability':
+                capability,
+            })
 
     return info
 
@@ -190,8 +227,10 @@ def _cleanup_args(args):
         args.n_channels = None
         args.n_layers = None
         args.use_bn = None
-    if args.arch not in ['resnet', 'resnet_preact', 'densenet', 'pyramidnet',
-                         'se_resnet_preact']:
+    if args.arch not in [
+            'resnet', 'resnet_preact', 'densenet', 'pyramidnet',
+            'se_resnet_preact'
+    ]:
         args.block_type = None
     if args.arch not in ['resnet_preact', 'se_resnet_preact']:
         args.remove_first_relu = None
@@ -216,25 +255,47 @@ def _cleanup_args(args):
         args.se_reduction = None
 
     # optimizer
-    if args.optimizer != 'sgd':
+    if args.optimizer not in ['sgd', 'lars']:
         args.momentum = None
+    if args.optimizer != 'sgd':
         args.nesterov = None
-        args.scheduler = 'none'
     if args.optimizer != 'adam':
         args.betas = None
+    if args.optimizer != 'lars':
+        args.lars_eps = None
+        args.lars_thresh = None
 
     # scheduler
     if args.scheduler != 'multistep':
         args.milestones = None
         args.lr_decay = None
-    if args.scheduler != 'cosine':
+    if args.scheduler not in ['cosine', 'sgdr']:
         args.lr_min = None
+    if args.scheduler != 'sgdr':
+        args.T0 = None
+        args.Tmult = None
 
-    # cutout
-    if not args.use_cutout:
+    # standard data augmentation
+    if args.use_random_crop is None:
+        if args.dataset in ['CIFAR10', 'CIFAR100', 'FashionMNIST', 'KMNIST']:
+            args.use_random_crop = True
+        else:
+            args.use_random_crop = False
+    if not args.use_random_crop:
+        args.random_crop_padding = None
+    if args.use_horizontal_flip is None:
+        if args.dataset in ['CIFAR10', 'CIFAR100', 'FashionMNIST']:
+            args.use_horizontal_flip = True
+        else:
+            args.use_horizontal_flip = False
+
+    # (dual-)cutout
+    if not args.use_cutout and not args.use_dual_cutout:
         args.cutout_size = None
         args.cutout_prob = None
         args.cutout_inside = None
+    if not args.use_dual_cutout:
+        args.dual_cutout_alpha = None
 
     # random erasing
     if not args.use_random_erasing:
@@ -246,6 +307,14 @@ def _cleanup_args(args):
     # mixup
     if not args.use_mixup:
         args.mixup_alpha = None
+
+    # RICAP
+    if not args.use_ricap:
+        args.ricap_beta = None
+
+    # label smoothing
+    if not args.use_label_smoothing:
+        args.label_smoothing_epsilon = None
 
     # TensorBoard
     if not args.tensorboard:
@@ -290,8 +359,6 @@ def get_config(args):
             'One of args.arch and args.config must be specified')
     if args.config is None:
         args.config = 'configs/{}.json'.format(args.arch)
-
-    args.gpus = list(map(lambda x: int(x), args.gpu.split(',')))
 
     args = _set_default_values(args)
     args = _cleanup_args(args)
