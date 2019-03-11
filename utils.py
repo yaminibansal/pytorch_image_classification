@@ -22,6 +22,7 @@ def str2bool(s):
 
 
 def load_model(config):
+    print(config)
     module = importlib.import_module('models.{}'.format(config['arch']))
     Network = getattr(module, 'Network')
     return Network(config)
@@ -218,6 +219,6 @@ def get_criterion(data_config):
         train_criterion = augmentations.cutout.DualCutoutCriterion(
             data_config['dual_cutout_alpha'])
     else:
-        train_criterion = nn.CrossEntropyLoss(reduction='mean')
-    test_criterion = nn.CrossEntropyLoss(reduction='mean')
+        train_criterion = nn.CrossEntropyLoss(size_average=True)
+    test_criterion = nn.CrossEntropyLoss(size_average=True)
     return train_criterion, test_criterion

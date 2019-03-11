@@ -28,6 +28,7 @@ def _get_model_config(args):
         'arch',
         'input_shape',
         'n_classes',
+        'weightscale',
         # vgg
         'n_channels',
         'n_layers',

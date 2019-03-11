@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument('--n_channels', type=str)
     parser.add_argument('--n_layers', type=str)
     parser.add_argument('--use_bn', type=str2bool)
+    parser.add_argument('--weightscale', type=float)
     #
     parser.add_argument('--base_channels', type=int)
     parser.add_argument('--block_type', type=str)
@@ -172,6 +173,7 @@ def parse_args():
         args.fp16 = True
 
     config = get_config(args)
+    print(config)
 
     return config
 
@@ -184,6 +186,7 @@ def train(epoch, model, optimizer, scheduler, criterion, train_loader, config,
     optim_config = config['optim_config']
     data_config = config['data_config']
     device = run_config['device']
+    
 
     logger.info('Train {}'.format(epoch))
 
@@ -593,4 +596,123 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    #main()
+    # parse command line argument and generate config dictionary
+    config = parse_args()
+    logger.info(json.dumps(config, indent=2))
+
+    run_config = config['run_config']
+    optim_config = config['optim_config']
+
+    # TensorBoard SummaryWriter
+    if run_config['tensorboard']:
+        writer = SummaryWriter(run_config['outdir'])
+    else:
+        writer = None
+
+    # set random seed
+    seed = run_config['seed']
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    epoch_seeds = np.random.randint(
+        np.iinfo(np.int32).max // 2, size=optim_config['epochs'])
+
+    # create output directory
+    outdir = pathlib.Path(run_config['outdir'])
+    outdir.mkdir(exist_ok=True, parents=True)
+
+    # save config as json file in output directory
+    outpath = outdir / 'config.json'
+    with open(outpath, 'w') as fout:
+        json.dump(config, fout, indent=2)
+
+    # load data loaders
+    train_loader, test_loader = get_loader(config['data_config'])
+
+    # load model
+    logger.info('Loading model...')
+    model = utils.load_model(config['model_config'])
+    norm_check = np.sqrt(torch.sum(model.stage1.conv0.weight**2).data.numpy())
+    n_params = sum([param.view(-1).size()[0] for param in model.parameters()])
+    logger.info('n_params: {}'.format(n_params))
+    logger.info('first layer weight norm: {}'.format(norm_check))
+
+    if run_config['fp16'] and not run_config['use_amp']:
+        model.half()
+        for layer in model.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.float()
+
+    device = run_config['device']
+    if device is not 'cpu' and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    model.to(device)
+    logger.info('Done')
+
+    train_criterion, test_criterion = utils.get_criterion(
+        config['data_config'])
+
+    # create optimizer
+    if optim_config['no_weight_decay_on_bn']:
+        params = [
+            {
+                'params': [
+                    param for name, param in model.named_parameters()
+                    if 'bn' not in name
+                ]
+            },
+            {
+                'params': [
+                    param for name, param in model.named_parameters()
+                    if 'bn' in name
+                ],
+                'weight_decay':
+                0
+            },
+        ]
+    else:
+        params = model.parameters()
+    optim_config['steps_per_epoch'] = len(train_loader)
+    optimizer, scheduler = utils.create_optimizer(params, optim_config)
+
+    # for mixed-precision
+    amp_handle = apex.amp.init(
+        enabled=run_config['use_amp']) if is_apex_available else None
+
+    # run test before start training
+    if run_config['test_first']:
+        test(0, model, test_criterion, test_loader, run_config, writer)
+
+    state = {
+        'config': config,
+        'state_dict': None,
+        'optimizer': None,
+        'epoch': 0,
+        'accuracy': 0,
+        'best_accuracy': 0,
+        'best_epoch': 0,
+    }
+    epoch_logs = []
+    for epoch, seed in zip(range(1, optim_config['epochs'] + 1), epoch_seeds):
+        np.random.seed(seed)
+        # train
+        train_log = train(epoch, model, optimizer, scheduler, train_criterion,
+                          train_loader, config, writer, amp_handle)
+
+        # test
+        test_log = test(epoch, model, test_criterion, test_loader, run_config,
+                        writer)
+
+        epoch_log = train_log.copy()
+        epoch_log.update(test_log)
+        epoch_logs.append(epoch_log)
+        utils.save_epoch_logs(epoch_logs, outdir)
+
+        # update state dictionary
+        state = update_state(state, epoch, epoch_log['test']['accuracy'],
+                             model, optimizer)
+
+        # save model
+        utils.save_checkpoint(state, outdir)
+
